@@ -41,6 +41,13 @@ var (
 	ErrContainerStartTimeout = errors.New("The container failed to start due to timed out.")
 )
 
+type StreamConfig struct {
+	stdout    *broadcastwriter.BroadcastWriter
+	stderr    *broadcastwriter.BroadcastWriter
+	stdin     io.ReadCloser
+	stdinPipe io.WriteCloser
+}
+
 type Container struct {
 	*State
 	root   string // Path to the "home" of the container, including metadata.
@@ -65,11 +72,8 @@ type Container struct {
 	Driver         string
 	ExecDriver     string
 
-	command   *execdriver.Command
-	stdout    *broadcastwriter.BroadcastWriter
-	stderr    *broadcastwriter.BroadcastWriter
-	stdin     io.ReadCloser
-	stdinPipe io.WriteCloser
+	command *execdriver.Command
+	StreamConfig
 
 	daemon                   *Daemon
 	MountLabel, ProcessLabel string
@@ -247,26 +251,31 @@ func populateCommand(c *Container, env []string) error {
 		CpuShares:  c.Config.CpuShares,
 		Cpuset:     c.Config.Cpuset,
 	}
+
+	processConfig := execdriver.ProcessConfig{
+		Privileged: c.hostConfig.Privileged,
+		Entrypoint: c.Path,
+		Arguments:  c.Args,
+		Tty:        c.Config.Tty,
+		User:       c.Config.User,
+	}
+	processConfig.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	processConfig.Env = env
 	c.command = &execdriver.Command{
 		ID:                 c.ID,
-		Privileged:         c.hostConfig.Privileged,
 		Rootfs:             c.RootfsPath(),
 		InitPath:           "/.dockerinit",
-		Entrypoint:         c.Path,
-		Arguments:          c.Args,
 		WorkingDir:         c.Config.WorkingDir,
 		Network:            en,
-		Tty:                c.Config.Tty,
-		User:               c.Config.User,
 		Config:             context,
 		Resources:          resources,
 		AllowedDevices:     allowedDevices,
 		AutoCreatedDevices: autoCreatedDevices,
 		CapAdd:             c.hostConfig.CapAdd,
 		CapDrop:            c.hostConfig.CapDrop,
+		ProcessConfig:      processConfig,
 	}
-	c.command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	c.command.Env = env
+
 	return nil
 }
 
@@ -274,7 +283,7 @@ func (container *Container) Start() (err error) {
 	container.Lock()
 	defer container.Unlock()
 
-	if container.State.Running {
+	if container.Running {
 		return nil
 	}
 
@@ -324,7 +333,7 @@ func (container *Container) Run() error {
 	if err := container.Start(); err != nil {
 		return err
 	}
-	container.State.WaitStop(-1 * time.Second)
+	container.WaitStop(-1 * time.Second)
 	return nil
 }
 
@@ -338,11 +347,11 @@ func (container *Container) Output() (output []byte, err error) {
 		return nil, err
 	}
 	output, err = ioutil.ReadAll(pipe)
-	container.State.WaitStop(-1 * time.Second)
+	container.WaitStop(-1 * time.Second)
 	return output, err
 }
 
-// Container.StdinPipe returns a WriteCloser which can be used to feed data
+// StreamConfig.StdinPipe returns a WriteCloser which can be used to feed data
 // to the standard input of the container's active process.
 // Container.StdoutPipe and Container.StderrPipe each return a ReadCloser
 // which can be used to retrieve the standard output (and error) generated
@@ -350,31 +359,31 @@ func (container *Container) Output() (output []byte, err error) {
 // copied and delivered to all StdoutPipe and StderrPipe consumers, using
 // a kind of "broadcaster".
 
-func (container *Container) StdinPipe() (io.WriteCloser, error) {
-	return container.stdinPipe, nil
+func (streamConfig *StreamConfig) StdinPipe() (io.WriteCloser, error) {
+	return streamConfig.stdinPipe, nil
 }
 
-func (container *Container) StdoutPipe() (io.ReadCloser, error) {
+func (streamConfig *StreamConfig) StdoutPipe() (io.ReadCloser, error) {
 	reader, writer := io.Pipe()
-	container.stdout.AddWriter(writer, "")
+	streamConfig.stdout.AddWriter(writer, "")
 	return utils.NewBufReader(reader), nil
 }
 
-func (container *Container) StderrPipe() (io.ReadCloser, error) {
+func (streamConfig *StreamConfig) StderrPipe() (io.ReadCloser, error) {
 	reader, writer := io.Pipe()
-	container.stderr.AddWriter(writer, "")
+	streamConfig.stderr.AddWriter(writer, "")
 	return utils.NewBufReader(reader), nil
 }
 
-func (container *Container) StdoutLogPipe() io.ReadCloser {
+func (streamConfig *StreamConfig) StdoutLogPipe() io.ReadCloser {
 	reader, writer := io.Pipe()
-	container.stdout.AddWriter(writer, "stdout")
+	streamConfig.stdout.AddWriter(writer, "stdout")
 	return utils.NewBufReader(reader)
 }
 
-func (container *Container) StderrLogPipe() io.ReadCloser {
+func (streamConfig *StreamConfig) StderrLogPipe() io.ReadCloser {
 	reader, writer := io.Pipe()
-	container.stderr.AddWriter(writer, "stderr")
+	streamConfig.stderr.AddWriter(writer, "stderr")
 	return utils.NewBufReader(reader)
 }
 
@@ -524,11 +533,11 @@ func (container *Container) KillSig(sig int) error {
 	defer container.Unlock()
 
 	// We could unpause the container for them rather than returning this error
-	if container.State.Paused {
+	if container.Paused {
 		return fmt.Errorf("Container %s is paused. Unpause the container before stopping", container.ID)
 	}
 
-	if !container.State.Running {
+	if !container.Running {
 		return nil
 	}
 
@@ -539,7 +548,7 @@ func (container *Container) KillSig(sig int) error {
 	// if the container is currently restarting we do not need to send the signal
 	// to the process.  Telling the monitor that it should exit on it's next event
 	// loop is enough
-	if container.State.Restarting {
+	if container.Restarting {
 		return nil
 	}
 
@@ -547,27 +556,27 @@ func (container *Container) KillSig(sig int) error {
 }
 
 func (container *Container) Pause() error {
-	if container.State.IsPaused() {
+	if container.IsPaused() {
 		return fmt.Errorf("Container %s is already paused", container.ID)
 	}
-	if !container.State.IsRunning() {
+	if !container.IsRunning() {
 		return fmt.Errorf("Container %s is not running", container.ID)
 	}
 	return container.daemon.Pause(container)
 }
 
 func (container *Container) Unpause() error {
-	if !container.State.IsPaused() {
+	if !container.IsPaused() {
 		return fmt.Errorf("Container %s is not paused", container.ID)
 	}
-	if !container.State.IsRunning() {
+	if !container.IsRunning() {
 		return fmt.Errorf("Container %s is not running", container.ID)
 	}
 	return container.daemon.Unpause(container)
 }
 
 func (container *Container) Kill() error {
-	if !container.State.IsRunning() {
+	if !container.IsRunning() {
 		return nil
 	}
 
@@ -577,9 +586,9 @@ func (container *Container) Kill() error {
 	}
 
 	// 2. Wait for the process to die, in last resort, try to kill the process directly
-	if _, err := container.State.WaitStop(10 * time.Second); err != nil {
+	if _, err := container.WaitStop(10 * time.Second); err != nil {
 		// Ensure that we don't kill ourselves
-		if pid := container.State.GetPid(); pid != 0 {
+		if pid := container.GetPid(); pid != 0 {
 			log.Infof("Container %s failed to exit within 10 seconds of kill - trying direct SIGKILL", utils.TruncateID(container.ID))
 			if err := syscall.Kill(pid, 9); err != nil {
 				return err
@@ -587,12 +596,12 @@ func (container *Container) Kill() error {
 		}
 	}
 
-	container.State.WaitStop(-1 * time.Second)
+	container.WaitStop(-1 * time.Second)
 	return nil
 }
 
 func (container *Container) Stop(seconds int) error {
-	if !container.State.IsRunning() {
+	if !container.IsRunning() {
 		return nil
 	}
 
@@ -605,11 +614,11 @@ func (container *Container) Stop(seconds int) error {
 	}
 
 	// 2. Wait for the process to exit on its own
-	if _, err := container.State.WaitStop(time.Duration(seconds) * time.Second); err != nil {
+	if _, err := container.WaitStop(time.Duration(seconds) * time.Second); err != nil {
 		log.Infof("Container %v failed to exit within %d seconds of SIGTERM - using the force", container.ID, seconds)
 		// 3. If it doesn't, then send SIGKILL
 		if err := container.Kill(); err != nil {
-			container.State.WaitStop(-1 * time.Second)
+			container.WaitStop(-1 * time.Second)
 			return err
 		}
 	}
@@ -631,7 +640,7 @@ func (container *Container) Restart(seconds int) error {
 }
 
 func (container *Container) Resize(h, w int) error {
-	return container.command.Terminal.Resize(h, w)
+	return container.command.ProcessConfig.Terminal.Resize(h, w)
 }
 
 func (container *Container) ExportRw() (archive.Archive, error) {
@@ -815,7 +824,7 @@ func (container *Container) Exposes(p nat.Port) bool {
 }
 
 func (container *Container) GetPtyMaster() (*os.File, error) {
-	ttyConsole, ok := container.command.Terminal.(execdriver.TtyTerminal)
+	ttyConsole, ok := container.command.ProcessConfig.Terminal.(execdriver.TtyTerminal)
 	if !ok {
 		return nil, ErrNoTTY
 	}
@@ -997,7 +1006,7 @@ func (container *Container) setupLinkedContainers() ([]string, error) {
 		}
 
 		for linkAlias, child := range children {
-			if !child.State.IsRunning() {
+			if !child.IsRunning() {
 				return nil, fmt.Errorf("Cannot link to a non running container: %s AS %s", child.Name, linkAlias)
 			}
 
@@ -1164,7 +1173,7 @@ func (container *Container) getNetworkedContainer() (*Container, error) {
 		if nc == nil {
 			return nil, fmt.Errorf("no such container to join network: %s", parts[1])
 		}
-		if !nc.State.IsRunning() {
+		if !nc.IsRunning() {
 			return nil, fmt.Errorf("cannot join network of a non running container: %s", parts[1])
 		}
 		return nc, nil
